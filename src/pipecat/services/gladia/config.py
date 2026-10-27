@@ -123,6 +123,38 @@ class RealtimeProcessingConfig(BaseModel):
     sentiment_analysis: bool | None = None
 
 
+class EndOfTurnConfig(BaseModel):
+    """Configuration for Gladia's end-of-turn detection.
+
+    Available on the Gladia Enterprise API (``https://<region>.api.gladia.io``).
+    Fields left as None use the server defaults (``GET /v2/live/defaults``).
+
+    Parameters:
+        eot_threshold: End-of-turn probability, between 0 and 1, above which the turn ends.
+        eager_eot_threshold: Probability from which an ``eager_end_of_turn`` is sent,
+            at most ``eot_threshold``. None sends no eager end of turn.
+        silence_ms: Silence, in milliseconds, before a pause is evaluated.
+        stop_s: Silence, in seconds, that ends the turn whatever the probability.
+        min_end_of_turn_silence_when_confident: Silence, in milliseconds, that must follow
+            a turn judged complete before the end of turn is sent.
+        window_s: Audio, in seconds, an evaluation reads.
+        reeval_ms: Interval, in milliseconds, between two evaluations of the same pause.
+        emit_scores: Also send an ``end_of_turn_score`` message for each evaluation.
+        speculation: Compare each final to the text of its end of turn and send a
+            ``speculation`` verdict.
+    """
+
+    eot_threshold: float | None = None
+    eager_eot_threshold: float | None = None
+    silence_ms: int | None = None
+    stop_s: float | None = None
+    min_end_of_turn_silence_when_confident: int | None = None
+    window_s: float | None = None
+    reeval_ms: int | None = None
+    emit_scores: bool | None = None
+    speculation: bool | None = None
+
+
 class MessagesConfig(BaseModel):
     """Configuration for controlling which message types are sent via WebSocket.
 
