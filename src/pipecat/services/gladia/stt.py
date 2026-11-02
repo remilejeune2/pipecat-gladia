@@ -56,6 +56,10 @@ from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
+# The most audio a reconnect sends a new Enterprise session again: the utterance
+# that was open when the connection dropped.
+_ENTERPRISE_REPLAY_MAX_S = 15.0
+
 # Fields of Gladia's cloud API that the Enterprise API refuses, failing the session.
 _CLOUD_ONLY_FIELDS = (
     ("pre_processing", "audio_enhancer"),
@@ -668,11 +672,7 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
         """
         # Initialize session if needed
         if not self._session_url:
-            settings = self._prepare_settings()
-            response = await self._setup_gladia(settings)
-            self._session_url = response["url"]
-            self._session_id = response["id"]
-            logger.info(f"{self} Session URL: {self._session_url}")
+            await self._start_session()
 
         await self._connect_websocket()
 
@@ -682,6 +682,27 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
         # loop goes straight to its reconnect path, which retries the connect.
         if not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
+
+    async def _start_session(self):
+        """Create a Gladia session: its URL is the one the websocket connects to."""
+        response = await self._setup_gladia(self._prepare_settings())
+        self._session_url = response["url"]
+        self._session_id = response["id"]
+        logger.info(f"{self} Session URL: {self._session_url}")
+
+    async def _reconnect_websocket(self, attempt_number: int) -> bool:
+        """Reconnect, in a new session on the Enterprise API.
+
+        The cloud API lets a dropped connection rejoin its session. On the Enterprise
+        API the session URL carries a single-use token (a second connection is closed
+        with 4401 "Token already used"), so a new session is created, and the
+        utterance that was open is sent to it again.
+        """
+        if self._is_enterprise_api:
+            await self._disconnect_websocket()
+            self._session_url = None
+            await self._start_session()
+        return await super()._reconnect_websocket(attempt_number)
 
     async def _disconnect(self):
         """Disconnect from the Gladia service.
@@ -861,12 +882,39 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
             message = {"type": "audio_chunk", "data": {"chunk": data}}
             await self._websocket.send(json.dumps(message))
 
+    def _audio_bytes_per_second(self) -> int:
+        bytes_per_sample = (self._bit_depth or 16) // 8
+        return self.sample_rate * bytes_per_sample * (self._channels or 1)
+
+    async def _trim_audio_buffer(self, end_byte: int):
+        """Drop the buffered audio up to ``end_byte`` of the session: Gladia has it.
+
+        The cloud API acknowledges each chunk. The Enterprise API acknowledges audio
+        only when asked, seconds late, so there a final's end does it: the buffer then
+        holds the utterance still open, which a reconnect sends to the new session.
+        """
+        async with self._buffer_lock:
+            if end_byte > self._bytes_sent:
+                trim_size = end_byte - self._bytes_sent
+                self._audio_buffer = self._audio_buffer[trim_size:]
+                self._bytes_sent = end_byte
+
     async def _send_buffered_audio(self):
         """Send any buffered audio after reconnection."""
         async with self._buffer_lock:
+            # A new session hears the utterance that was open, not a long silence
+            replay_max = int(_ENTERPRISE_REPLAY_MAX_S * self._audio_bytes_per_second())
+            if self._is_enterprise_api and len(self._audio_buffer) > replay_max:
+                self._audio_buffer = self._audio_buffer[-replay_max:]
             if self._audio_buffer:
                 logger.debug(f"{self} Sending {len(self._audio_buffer)} bytes of buffered audio")
-                await self._send_audio(bytes(self._audio_buffer))
+                if self._is_enterprise_api:
+                    # in chunks of a second, the size of the audio a client streams
+                    step = self._audio_bytes_per_second()
+                    for i in range(0, len(self._audio_buffer), step):
+                        await self._send_audio(bytes(self._audio_buffer[i : i + step]))
+                else:
+                    await self._send_audio(bytes(self._audio_buffer))
 
     async def _send_stop_recording(self):
         if self._websocket and self._websocket.state is State.OPEN:
@@ -896,14 +944,7 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
 
                 # Handle audio chunk acknowledgments
                 if content["type"] == "audio_chunk" and content.get("acknowledged"):
-                    byte_range = content["data"]["byte_range"]
-                    async with self._buffer_lock:
-                        # Update bytes sent and trim acknowledged data from buffer
-                        end_byte = byte_range[1]
-                        if end_byte > self._bytes_sent:
-                            trim_size = end_byte - self._bytes_sent
-                            self._audio_buffer = self._audio_buffer[trim_size:]
-                            self._bytes_sent = end_byte
+                    await self._trim_audio_buffer(content["data"]["byte_range"][1])
 
                 elif content["type"] == "audio_chunk":
                     error = (content.get("error") or {}).get("message", "Unknown error")
@@ -915,6 +956,11 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
                     transcript = utterance["text"]
                     is_final = content["data"]["is_final"]
                     if is_final:
+                        if self._is_enterprise_api and utterance.get("end") is not None:
+                            # the audio up to a final's end is transcribed for good
+                            await self._trim_audio_buffer(
+                                int(utterance["end"] * self._audio_bytes_per_second())
+                            )
                         if content["data"].get("from_finalize"):
                             self.confirm_finalize()
                         self._turn_finals.append(transcript)

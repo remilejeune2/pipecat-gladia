@@ -689,3 +689,79 @@ async def test_diarization_puts_the_speaker_in_the_user_id():
     plain.push_frame = AsyncMock()
     await plain._receive_messages()
     assert [f.user_id for f in _pushed(plain)] == [plain._user_id] * 2
+
+
+EU1 = "https://eu1.api.gladia.io/v2/live"
+
+
+def _final_until(end):
+    message = _transcript("Bonjour.", True)
+    message["data"]["utterance"]["end"] = end
+    return message
+
+
+@pytest.mark.asyncio
+async def test_enterprise_reconnect_opens_a_new_session(monkeypatch):
+    """eu1's session URL carries a single-use token: a reconnect needs a new session."""
+    sessions = iter([{"url": "wss://eu1/first", "id": "1"}, {"url": "wss://eu1/second", "id": "2"}])
+    service, _ = _connected_service(url=EU1)
+    monkeypatch.setattr(service, "_setup_gladia", AsyncMock(side_effect=lambda _: next(sessions)))
+    connected = []
+
+    async def connect(url):
+        connected.append(url)
+        return _FakeWebsocket()
+
+    monkeypatch.setattr(service, "_websocket_connect", connect)
+    monkeypatch.setattr(service, "_verify_connection", AsyncMock(return_value=True))
+    await service._start_session()
+
+    assert await service._reconnect_websocket(1)
+    assert connected == ["wss://eu1/second"]
+    assert service._session_id == "2"
+
+
+@pytest.mark.asyncio
+async def test_cloud_reconnect_rejoins_its_session(monkeypatch):
+    service, _ = _connected_service()
+    service._session_url = "wss://cloud/session"
+    setup = AsyncMock()
+    monkeypatch.setattr(service, "_setup_gladia", setup)
+    connected = []
+
+    async def connect(url):
+        connected.append(url)
+        return _FakeWebsocket()
+
+    monkeypatch.setattr(service, "_websocket_connect", connect)
+    monkeypatch.setattr(service, "_verify_connection", AsyncMock(return_value=True))
+
+    assert await service._reconnect_websocket(1)
+    assert connected == ["wss://cloud/session"]
+    setup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enterprise_final_drops_the_audio_it_transcribed():
+    """The buffer keeps the open utterance only, for a new session to hear again."""
+    service, _ = _connected_service(url=EU1, incoming=[_final_until(1.5)])
+    service._sample_rate = 16000  # set when the pipeline starts
+    service.push_frame = AsyncMock()
+    service._audio_buffer = bytearray(b"\x01\x00" * 16000 * 2)  # 2 s sent
+
+    await service._receive_messages()
+
+    assert len(service._audio_buffer) == 16000  # the last 0.5 s
+
+
+@pytest.mark.asyncio
+async def test_enterprise_replay_sends_at_most_the_last_seconds_in_chunks():
+    service, websocket = _connected_service(url=EU1)
+    service._sample_rate = 16000
+    service._audio_buffer = bytearray(b"\x01\x00" * 16000 * 20)  # 20 s without a final
+
+    await service._send_buffered_audio()
+
+    chunks = [m for m in websocket.sent if m["type"] == "audio_chunk"]
+    assert len(chunks) == 15
+    assert len(service._audio_buffer) == 2 * 16000 * 15
