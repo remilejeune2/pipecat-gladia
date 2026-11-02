@@ -16,6 +16,7 @@ import json
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import aiohttp
 import websockets
@@ -33,9 +34,12 @@ from pipecat.frames.frames import (
     STTMetadataFrame,
     TranscriptionFrame,
     TranslationFrame,
+    VADUserStoppedSpeakingFrame,
 )
-from pipecat.processors.frame_processor import FrameProcessorSetup
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.services.gladia.config import (
+    DiarizationConfig,
+    EndOfTurnConfig,
     GladiaInputParams,
     LanguageConfig,
     MessagesConfig,
@@ -46,10 +50,31 @@ from pipecat.services.settings import STTSettings
 from pipecat.services.stt_latency import GLADIA_TTFS_P99
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language, resolve_language
+from pipecat.turns.eager_end_of_turn_mixin import EagerEndOfTurnSTTServiceMixin
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
+
+# The most audio a reconnect sends a new Enterprise session again: the utterance
+# that was open when the connection dropped.
+_ENTERPRISE_REPLAY_MAX_S = 15.0
+
+# Fields of Gladia's cloud API that the Enterprise API refuses, failing the session.
+_CLOUD_ONLY_FIELDS = (
+    ("pre_processing", "audio_enhancer"),
+    ("realtime_processing", "words_accurate_timestamps"),
+)
+
+
+def _drop_cloud_only_fields(settings: dict[str, Any]) -> None:
+    """Leave out the cloud-only fields the Enterprise API would refuse."""
+    for section, name in _CLOUD_ONLY_FIELDS:
+        if name in settings.get(section, {}):
+            logger.warning(f"Gladia's Enterprise API has no {section}.{name}: it is left out")
+            del settings[section][name]
+            if not settings[section]:
+                del settings[section]
 
 
 def language_to_gladia_language(language: Language) -> str:
@@ -183,6 +208,17 @@ class GladiaSTTSettings(STTSettings):
         realtime_processing: Real-time processing features.
         messages_config: WebSocket message filtering options.
         enable_vad: Enable VAD to trigger end of utterance detection.
+        end_of_turn: End-of-turn detection (Gladia Enterprise API). None leaves it off.
+        diarization: Label each final with its speaker (Gladia Enterprise API): the
+            transcription frames' ``user_id`` is then ``"S0"``, ``"S1"``...
+        diarization_config: Diarization options. Needs ``diarization``.
+        numerals: Write spoken numbers, amounts and times with digits (Gladia Enterprise
+            API): True, or ``{"region": "FR"}`` for a country's phone numbers and dates.
+        emails: Write dictated e-mail addresses as addresses (Gladia Enterprise API).
+        addresses: Write dictated postal addresses in their standard form (Gladia
+            Enterprise API): True, or its options (``{"country": "FR"}``).
+        pii: Redact personal data in the finals (Gladia Enterprise API): True, or its
+            options (``{"entities": "pci", "mode": "mask"}``). No partials are sent then.
     """
 
     language_config: LanguageConfig | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
@@ -197,20 +233,51 @@ class GladiaSTTSettings(STTSettings):
     )
     messages_config: MessagesConfig | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
     enable_vad: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    end_of_turn: EndOfTurnConfig | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    diarization: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    diarization_config: DiarizationConfig | None | NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    numerals: bool | dict[str, Any] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    emails: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    addresses: bool | dict[str, Any] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    pii: bool | dict[str, Any] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
-class GladiaSTTService(WebsocketSTTService):
+class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
     """Speech-to-Text service using Gladia's API.
 
     This service connects to Gladia's WebSocket API for real-time transcription
     with support for multiple languages, custom vocabulary, and various processing options.
     Provides automatic reconnection, audio buffering, and comprehensive error handling.
 
+    On the Gladia Enterprise API, pass its region's address as ``url``
+    (``https://eu1.api.gladia.io/v2/live``) and set ``end_of_turn`` to let Gladia
+    detect the end of the user's turn. Gladia's speech start and end of turn then
+    propose the user turn boundaries, and the final that closes a turn is marked
+    finalized. With ``enable_eager_end_of_turn``, Gladia's ``eager_end_of_turn`` and
+    ``turn_resumed`` drive :class:`~pipecat.turns.user_turn_strategies.EagerUserTurnStrategies`.
+    With ``enable_finalize``, the local VAD's end of speech asks Gladia for the final
+    at once, instead of waiting for its endpointing.
+
+    Event handlers available with ``end_of_turn``:
+
+    - on_end_of_turn(service, data)
+    - on_eager_end_of_turn(service, data)
+    - on_turn_resumed(service, data)
+    - on_hold(service, data)
+
+    ``data`` is the ``data`` object of the Gladia message.
+
     For complete API documentation, see: https://docs.gladia.io/api-reference/v2/live/init
+    and, for the Enterprise API, https://eu1.docs.gladia.io/live/end-of-turn/
     """
 
     Settings = GladiaSTTSettings
     _settings: Settings
+    # Eager threshold applied when eager end of turn is enabled without one. It must
+    # stay at most the end-of-turn threshold, whose server default is 0.9.
+    _DEFAULT_EAGER_EOT_THRESHOLD = 0.5
 
     def __init__(
         self,
@@ -226,6 +293,8 @@ class GladiaSTTService(WebsocketSTTService):
         params: GladiaInputParams | None = None,
         max_buffer_size: int = 1024 * 1024 * 20,  # 20MB default buffer
         should_interrupt: bool = True,
+        enable_eager_end_of_turn: bool = False,
+        enable_finalize: bool = False,
         settings: Settings | None = None,
         ttfs_p99_latency: float | None = GLADIA_TTFS_P99,
         **kwargs,
@@ -259,6 +328,15 @@ class GladiaSTTService(WebsocketSTTService):
                 strategies this service recommends, which own the interruption; a
                 user-supplied ``user_turn_strategies`` overrides the recommendation
                 and this setting with it. Defaults to True.
+            enable_eager_end_of_turn: Whether to answer Gladia's ``eager_end_of_turn``
+                ahead of the committed end of turn. Off by default: it spends an
+                inference on every prediction, including the ones Gladia withdraws.
+                Turns ``end_of_turn`` on, with ``eager_eot_threshold`` set to
+                ``_DEFAULT_EAGER_EOT_THRESHOLD`` when the settings leave it unset.
+            enable_finalize: Whether to send Gladia's ``finalize`` when the local VAD
+                hears the user stop, so the final comes without waiting for Gladia's
+                endpointing, as Deepgram's ``Finalize`` does. Gladia Enterprise API only;
+                ignored with ``end_of_turn``, where Gladia ends the turn. Defaults to False.
             settings: Runtime-updatable settings. When provided alongside deprecated
                 parameters, ``settings`` values take precedence.
             ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
@@ -277,6 +355,13 @@ class GladiaSTTService(WebsocketSTTService):
             realtime_processing=None,
             messages_config=None,
             enable_vad=False,
+            end_of_turn=None,
+            diarization=None,
+            diarization_config=None,
+            numerals=None,
+            emails=None,
+            addresses=None,
+            pii=None,
         )
 
         # 2. Apply direct init arg overrides (deprecated)
@@ -317,8 +402,19 @@ class GladiaSTTService(WebsocketSTTService):
             keepalive_timeout=20,
             keepalive_interval=5,
             settings=default_settings,
+            enable_eager_end_of_turn=enable_eager_end_of_turn,
             **kwargs,
         )
+
+        # Gladia sends no eager end of turn unless a threshold asks for one, so an
+        # unconfigured threshold would leave the feature silently inert.
+        if self.eager_end_of_turn_enabled:
+            end_of_turn = assert_given(self._settings.end_of_turn) or EndOfTurnConfig()
+            if end_of_turn.eager_eot_threshold is None:
+                end_of_turn = end_of_turn.model_copy(
+                    update={"eager_eot_threshold": self._DEFAULT_EAGER_EOT_THRESHOLD}
+                )
+            self._settings.end_of_turn = end_of_turn
 
         self._api_key = api_key
         self._region = region
@@ -344,6 +440,16 @@ class GladiaSTTService(WebsocketSTTService):
         # VAD state tracking
         self._is_speaking = False
         self._should_interrupt = should_interrupt
+        self._enable_finalize = enable_finalize
+
+        # Text of the current turn, for the eager end of turn
+        self._turn_finals: list[str] = []
+        self._turn_partial = ""
+
+        self._register_event_handler("on_end_of_turn")
+        self._register_event_handler("on_eager_end_of_turn")
+        self._register_event_handler("on_turn_resumed")
+        self._register_event_handler("on_hold")
 
     def __str__(self):
         return f"{self.name} [{self._session_id}]"
@@ -356,17 +462,27 @@ class GladiaSTTService(WebsocketSTTService):
         """
         return True
 
-    def service_metadata_frame(self) -> STTMetadataFrame:
-        """Request external turn strategies when Gladia's VAD drives endpointing.
+    @property
+    def end_of_turn_enabled(self) -> bool:
+        """Whether Gladia detects the end of the user's turn."""
+        return assert_given(self._settings.end_of_turn) is not None
 
-        With ``enable_vad`` set, Gladia detects end of utterance server-side and
-        emits ``ProposedUserStarted/StoppedSpeakingFrame``, so the user aggregator
-        resolves those rather than running local VAD/smart-turn. Without it the
-        defaults are left in place. Applied unless the user passed their own
-        ``user_turn_strategies``.
+    def service_metadata_frame(self) -> STTMetadataFrame:
+        """Request external turn strategies when Gladia drives the user turn.
+
+        With ``end_of_turn`` or ``enable_vad`` set, Gladia emits
+        ``ProposedUserStarted/StoppedSpeakingFrame``, so the user aggregator
+        resolves those rather than running local VAD/smart-turn. With
+        ``enable_eager_end_of_turn``, the recommendation also answers Gladia's
+        eager end of turn. Without either the defaults are left in place. Applied
+        unless the user passed their own ``user_turn_strategies``.
         """
         frame = super().service_metadata_frame()
-        if self._settings.enable_vad:
+        if self.end_of_turn_enabled:
+            frame.user_turn_strategies = self.recommended_user_turn_strategies(
+                enable_interruptions=self._should_interrupt,
+            )
+        elif self._settings.enable_vad:
             frame.user_turn_strategies = ExternalUserTurnStrategies(
                 enable_interruptions=self._should_interrupt,
             )
@@ -382,6 +498,18 @@ class GladiaSTTService(WebsocketSTTService):
             The Gladia language code string, or None if not supported.
         """
         return language_to_gladia_language(language)
+
+    @property
+    def _is_enterprise_api(self) -> bool:
+        """Whether the session goes to the Enterprise API (eu1, us1) rather than the cloud."""
+        return urlparse(self._url).hostname != "api.gladia.io"
+
+    def _speaker_user_id(self, utterance: dict[str, Any]) -> str:
+        """The user ID of an utterance: its speaker, with diarization."""
+        speaker = utterance.get("speaker")
+        if self._settings.diarization and isinstance(speaker, int):
+            return f"S{speaker}"
+        return self._user_id
 
     def _prepare_settings(self) -> dict[str, Any]:
         s = self._settings
@@ -425,6 +553,28 @@ class GladiaSTTService(WebsocketSTTService):
         messages_config = assert_given(s.messages_config)
         if messages_config:
             settings["messages_config"] = messages_config.model_dump(exclude_none=True)
+
+        # Add end_of_turn configuration if provided
+        end_of_turn = assert_given(s.end_of_turn)
+        if end_of_turn is not None:
+            settings["end_of_turn"] = end_of_turn.model_dump(exclude_none=True)
+
+        for name in ("diarization", "numerals", "emails", "addresses", "pii"):
+            value = assert_given(getattr(s, name))
+            if value is not None and value is not False:
+                settings[name] = value
+        diarization_config = assert_given(s.diarization_config)
+        if diarization_config is not None and s.diarization:
+            settings["diarization_config"] = diarization_config.model_dump(exclude_none=True)
+
+        if self._is_enterprise_api:
+            _drop_cloud_only_fields(settings)
+
+        # The eager end of turn carries no text: build it from the partials
+        if self.eager_end_of_turn_enabled:
+            settings.setdefault("messages_config", {}).setdefault(
+                "receive_partial_transcripts", True
+            )
 
         return settings
 
@@ -522,11 +672,7 @@ class GladiaSTTService(WebsocketSTTService):
         """
         # Initialize session if needed
         if not self._session_url:
-            settings = self._prepare_settings()
-            response = await self._setup_gladia(settings)
-            self._session_url = response["url"]
-            self._session_id = response["id"]
-            logger.info(f"{self} Session URL: {self._session_url}")
+            await self._start_session()
 
         await self._connect_websocket()
 
@@ -536,6 +682,27 @@ class GladiaSTTService(WebsocketSTTService):
         # loop goes straight to its reconnect path, which retries the connect.
         if not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
+
+    async def _start_session(self):
+        """Create a Gladia session: its URL is the one the websocket connects to."""
+        response = await self._setup_gladia(self._prepare_settings())
+        self._session_url = response["url"]
+        self._session_id = response["id"]
+        logger.info(f"{self} Session URL: {self._session_url}")
+
+    async def _reconnect_websocket(self, attempt_number: int) -> bool:
+        """Reconnect, in a new session on the Enterprise API.
+
+        The cloud API lets a dropped connection rejoin its session. On the Enterprise
+        API the session URL carries a single-use token (a second connection is closed
+        with 4401 "Token already used"), so a new session is created, and the
+        utterance that was open is sent to it again.
+        """
+        if self._is_enterprise_api:
+            await self._disconnect_websocket()
+            self._session_url = None
+            await self._start_session()
+        return await super()._reconnect_websocket(attempt_number)
 
     async def _disconnect(self):
         """Disconnect from the Gladia service.
@@ -626,24 +793,87 @@ class GladiaSTTService(WebsocketSTTService):
         Broadcasts UserStartedSpeakingFrame and optionally triggers interruption
         when VAD is enabled.
         """
-        if not self._settings.enable_vad or self._is_speaking:
+        if not (self._settings.enable_vad or self.end_of_turn_enabled) or self._is_speaking:
             return
 
         logger.debug(f"{self} User started speaking")
         self._is_speaking = True
+        self._turn_finals = []
+        self._turn_partial = ""
 
         await self.broadcast_frame(ProposedUserStartedSpeakingFrame)
 
     async def _on_speech_ended(self):
         """Handle speech end event from Gladia.
 
-        Broadcasts UserStoppedSpeakingFrame when VAD is enabled.
+        Broadcasts UserStoppedSpeakingFrame when VAD is enabled. With end of turn,
+        the turn ends on Gladia's ``end_of_turn`` instead.
         """
-        if not self._settings.enable_vad or not self._is_speaking:
+        if not self._settings.enable_vad or self.end_of_turn_enabled or not self._is_speaking:
             return
         self._is_speaking = False
         await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
         logger.debug(f"{self} User stopped speaking")
+
+    async def _on_end_of_turn(self, data: dict[str, Any]):
+        """Handle Gladia's end of turn.
+
+        Gladia holds the final that closes the turn until the end of turn, and sends
+        it right after, so that final is marked finalized: its latency is reported as
+        soon as it arrives.
+        """
+        logger.debug(f"{self} User turn ended ({data.get('reason')})")
+        self._clear_eager_end_of_turn()
+        self.request_finalize()
+        self.confirm_finalize()
+        if self._is_speaking:
+            self._is_speaking = False
+            await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
+        await self._call_event_handler("on_end_of_turn", data)
+
+    async def _on_eager_end_of_turn(self, data: dict[str, Any]):
+        """Handle Gladia's eager end of turn: the turn has probably ended."""
+        text = data.get("text") or " ".join(
+            t.strip() for t in [*self._turn_finals, self._turn_partial] if t.strip()
+        )
+        await self._push_eager_end_of_turn(text, user_id=self._user_id, result=data)
+        await self._call_event_handler("on_eager_end_of_turn", data)
+
+    async def _on_turn_resumed(self, data: dict[str, Any]):
+        """Handle Gladia's turn resumed: the user went on after an eager end of turn."""
+        await self._cancel_eager_end_of_turn()
+        await self._call_event_handler("on_turn_resumed", data)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Ask Gladia for the final when the local VAD hears the user stop.
+
+        Args:
+            frame: Frame to process.
+            direction: Direction of frame processing.
+        """
+        await super().process_frame(frame, direction)
+        if (
+            isinstance(frame, VADUserStoppedSpeakingFrame)
+            and self._enable_finalize
+            and not self.end_of_turn_enabled
+            and self._websocket
+            and self._websocket.state is State.OPEN
+        ):
+            # https://eu1.docs.gladia.io/live/finalize/
+            self.request_finalize()
+            await self._websocket.send(json.dumps({"type": "finalize"}))
+
+    async def _on_finalize(self, content: dict[str, Any]):
+        """Handle Gladia's answer to ``finalize``, sent after the final it produced."""
+        data = content.get("data") or {}
+        if not content.get("acknowledged"):
+            error = (content.get("error") or {}).get("message", "Unknown error")
+            logger.debug(f"{self} finalize not acknowledged: {error}")
+        elif not data.get("finalized"):
+            # Gladia's endpointing had already sent the final: report its latency
+            # now instead of waiting for the TTFB timeout.
+            await self.stop_ttfb_metrics()
+            await self._cancel_ttfb_timeout()
 
     async def _send_audio(self, audio: bytes):
         """Send audio chunk with proper message format."""
@@ -652,12 +882,39 @@ class GladiaSTTService(WebsocketSTTService):
             message = {"type": "audio_chunk", "data": {"chunk": data}}
             await self._websocket.send(json.dumps(message))
 
+    def _audio_bytes_per_second(self) -> int:
+        bytes_per_sample = (self._bit_depth or 16) // 8
+        return self.sample_rate * bytes_per_sample * (self._channels or 1)
+
+    async def _trim_audio_buffer(self, end_byte: int):
+        """Drop the buffered audio up to ``end_byte`` of the session: Gladia has it.
+
+        The cloud API acknowledges each chunk. The Enterprise API acknowledges audio
+        only when asked, seconds late, so there a final's end does it: the buffer then
+        holds the utterance still open, which a reconnect sends to the new session.
+        """
+        async with self._buffer_lock:
+            if end_byte > self._bytes_sent:
+                trim_size = end_byte - self._bytes_sent
+                self._audio_buffer = self._audio_buffer[trim_size:]
+                self._bytes_sent = end_byte
+
     async def _send_buffered_audio(self):
         """Send any buffered audio after reconnection."""
         async with self._buffer_lock:
+            # A new session hears the utterance that was open, not a long silence
+            replay_max = int(_ENTERPRISE_REPLAY_MAX_S * self._audio_bytes_per_second())
+            if self._is_enterprise_api and len(self._audio_buffer) > replay_max:
+                self._audio_buffer = self._audio_buffer[-replay_max:]
             if self._audio_buffer:
                 logger.debug(f"{self} Sending {len(self._audio_buffer)} bytes of buffered audio")
-                await self._send_audio(bytes(self._audio_buffer))
+                if self._is_enterprise_api:
+                    # in chunks of a second, the size of the audio a client streams
+                    step = self._audio_bytes_per_second()
+                    for i in range(0, len(self._audio_buffer), step):
+                        await self._send_audio(bytes(self._audio_buffer[i : i + step]))
+                else:
+                    await self._send_audio(bytes(self._audio_buffer))
 
     async def _send_stop_recording(self):
         if self._websocket and self._websocket.state is State.OPEN:
@@ -687,14 +944,7 @@ class GladiaSTTService(WebsocketSTTService):
 
                 # Handle audio chunk acknowledgments
                 if content["type"] == "audio_chunk" and content.get("acknowledged"):
-                    byte_range = content["data"]["byte_range"]
-                    async with self._buffer_lock:
-                        # Update bytes sent and trim acknowledged data from buffer
-                        end_byte = byte_range[1]
-                        if end_byte > self._bytes_sent:
-                            trim_size = end_byte - self._bytes_sent
-                            self._audio_buffer = self._audio_buffer[trim_size:]
-                            self._bytes_sent = end_byte
+                    await self._trim_audio_buffer(content["data"]["byte_range"][1])
 
                 elif content["type"] == "audio_chunk":
                     error = (content.get("error") or {}).get("message", "Unknown error")
@@ -706,6 +956,15 @@ class GladiaSTTService(WebsocketSTTService):
                     transcript = utterance["text"]
                     is_final = content["data"]["is_final"]
                     if is_final:
+                        if self._is_enterprise_api and utterance.get("end") is not None:
+                            # the audio up to a final's end is transcribed for good
+                            await self._trim_audio_buffer(
+                                int(utterance["end"] * self._audio_bytes_per_second())
+                            )
+                        if content["data"].get("from_finalize"):
+                            self.confirm_finalize()
+                        self._turn_finals.append(transcript)
+                        self._turn_partial = ""
                         # Report usage before the transcription frame so
                         # tracing can attach it to the STT span the frame
                         # closes.
@@ -713,7 +972,7 @@ class GladiaSTTService(WebsocketSTTService):
                         await self.push_frame(
                             TranscriptionFrame(
                                 transcript,
-                                self._user_id,
+                                self._speaker_user_id(utterance),
                                 time_now_iso8601(),
                                 language,
                                 result=content,
@@ -725,10 +984,11 @@ class GladiaSTTService(WebsocketSTTService):
                             language=language,
                         )
                     else:
+                        self._turn_partial = transcript
                         await self.push_frame(
                             InterimTranscriptionFrame(
                                 transcript,
-                                self._user_id,
+                                self._speaker_user_id(utterance),
                                 time_now_iso8601(),
                                 language,
                                 result=content,
@@ -753,6 +1013,16 @@ class GladiaSTTService(WebsocketSTTService):
                     await self._on_speech_started()
                 elif content["type"] == "speech_end":
                     await self._on_speech_ended()
+                elif content["type"] == "end_of_turn":
+                    await self._on_end_of_turn(content.get("data") or {})
+                elif content["type"] == "eager_end_of_turn":
+                    await self._on_eager_end_of_turn(content.get("data") or {})
+                elif content["type"] == "turn_resumed":
+                    await self._on_turn_resumed(content.get("data") or {})
+                elif content["type"] == "finalize":
+                    await self._on_finalize(content)
+                elif content["type"] == "hold":
+                    await self._call_event_handler("on_hold", content.get("data") or {})
             except json.JSONDecodeError:
                 logger.warning(f"{self} Received non-JSON message: {message}")
 
