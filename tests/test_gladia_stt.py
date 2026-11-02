@@ -19,8 +19,9 @@ from pipecat.frames.frames import (
     ProposedUserStoppedSpeakingFrame,
     TranscriptionFrame,
     UserTurnResponseCancelFrame,
+    VADUserStoppedSpeakingFrame,
 )
-from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.gladia.config import EndOfTurnConfig
 from pipecat.services.gladia.stt import GladiaSTTService
 from pipecat.turns.user_turn_strategies import EagerUserTurnStrategies, ExternalUserTurnStrategies
@@ -506,3 +507,104 @@ async def test_transcripts_still_reach_the_pipeline_with_end_of_turn():
     frames = _pushed(service)
     assert [type(f) for f in frames] == [InterimTranscriptionFrame, TranscriptionFrame]
     assert frames[1].text == "Hello."
+
+
+def _skip_parent_process_frame(monkeypatch):
+    """Let process_frame run only GladiaSTTService's own handling."""
+    parent = next(c for c in GladiaSTTService.__mro__[1:] if "process_frame" in c.__dict__)
+    monkeypatch.setattr(parent, "process_frame", AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_vad_end_of_speech_sends_finalize(monkeypatch):
+    _skip_parent_process_frame(monkeypatch)
+    service, websocket = _connected_service(enable_finalize=True)
+
+    await service.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+    assert _message_types(websocket) == ["finalize"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_is_off_by_default(monkeypatch):
+    _skip_parent_process_frame(monkeypatch)
+    service, websocket = _connected_service()
+
+    await service.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+    assert _message_types(websocket) == []
+
+
+@pytest.mark.asyncio
+async def test_finalize_is_not_sent_when_gladia_ends_the_turn(monkeypatch):
+    _skip_parent_process_frame(monkeypatch)
+    service, websocket = _turn_service(enable_finalize=True)
+
+    await service.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+    assert _message_types(websocket) == []
+
+
+@pytest.mark.asyncio
+async def test_the_final_from_finalize_is_finalized(monkeypatch):
+    final = _transcript("Hello there.", True)
+    final["data"]["from_finalize"] = True
+    service, _ = _connected_service(
+        incoming=[
+            final,
+            {"type": "finalize", "acknowledged": True, "data": {"finalized": True}},
+            _transcript("Next turn.", True),
+        ],
+        enable_finalize=True,
+    )
+    service.request_finalize()
+    service.stop_ttfb_metrics = AsyncMock()
+    parent_push_frame = AsyncMock()
+    monkeypatch.setattr(FrameProcessor, "push_frame", parent_push_frame)
+
+    await service._receive_messages()
+
+    finals = [
+        call.args[0]
+        for call in parent_push_frame.call_args_list
+        if isinstance(call.args[0], TranscriptionFrame)
+    ]
+    assert [(f.text, f.finalized) for f in finals] == [
+        ("Hello there.", True),
+        ("Next turn.", False),
+    ]
+    service.stop_ttfb_metrics.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_nothing_to_finalize_reports_the_latency_at_once():
+    """Gladia's endpointing had already sent the final before the request."""
+    service, _ = _connected_service(
+        incoming=[{"type": "finalize", "acknowledged": True, "data": {"finalized": False}}],
+        enable_finalize=True,
+    )
+    service.stop_ttfb_metrics = AsyncMock()
+
+    await service._receive_messages()
+
+    service.stop_ttfb_metrics.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_finalize_waits_for_the_usual_final():
+    service, _ = _connected_service(
+        incoming=[
+            {
+                "type": "finalize",
+                "acknowledged": False,
+                "error": {"message": "finalize sent again within 200 ms"},
+                "data": None,
+            }
+        ],
+        enable_finalize=True,
+    )
+    service.stop_ttfb_metrics = AsyncMock()
+
+    await service._receive_messages()
+
+    service.stop_ttfb_metrics.assert_not_awaited()

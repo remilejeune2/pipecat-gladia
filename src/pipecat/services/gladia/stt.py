@@ -33,8 +33,9 @@ from pipecat.frames.frames import (
     STTMetadataFrame,
     TranscriptionFrame,
     TranslationFrame,
+    VADUserStoppedSpeakingFrame,
 )
-from pipecat.processors.frame_processor import FrameProcessorSetup
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.services.gladia.config import (
     EndOfTurnConfig,
     GladiaInputParams,
@@ -216,6 +217,8 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
     propose the user turn boundaries, and the final that closes a turn is marked
     finalized. With ``enable_eager_end_of_turn``, Gladia's ``eager_end_of_turn`` and
     ``turn_resumed`` drive :class:`~pipecat.turns.user_turn_strategies.EagerUserTurnStrategies`.
+    With ``enable_finalize``, the local VAD's end of speech asks Gladia for the final
+    at once, instead of waiting for its endpointing.
 
     Event handlers available with ``end_of_turn``:
 
@@ -251,6 +254,7 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
         max_buffer_size: int = 1024 * 1024 * 20,  # 20MB default buffer
         should_interrupt: bool = True,
         enable_eager_end_of_turn: bool = False,
+        enable_finalize: bool = False,
         settings: Settings | None = None,
         ttfs_p99_latency: float | None = GLADIA_TTFS_P99,
         **kwargs,
@@ -289,6 +293,10 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
                 inference on every prediction, including the ones Gladia withdraws.
                 Turns ``end_of_turn`` on, with ``eager_eot_threshold`` set to
                 ``_DEFAULT_EAGER_EOT_THRESHOLD`` when the settings leave it unset.
+            enable_finalize: Whether to send Gladia's ``finalize`` when the local VAD
+                hears the user stop, so the final comes without waiting for Gladia's
+                endpointing, as Deepgram's ``Finalize`` does. Gladia Enterprise API only;
+                ignored with ``end_of_turn``, where Gladia ends the turn. Defaults to False.
             settings: Runtime-updatable settings. When provided alongside deprecated
                 parameters, ``settings`` values take precedence.
             ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
@@ -386,6 +394,7 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
         # VAD state tracking
         self._is_speaking = False
         self._should_interrupt = should_interrupt
+        self._enable_finalize = enable_finalize
 
         # Text of the current turn, for the eager end of turn
         self._turn_finals: list[str] = []
@@ -749,6 +758,37 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
         await self._cancel_eager_end_of_turn()
         await self._call_event_handler("on_turn_resumed", data)
 
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Ask Gladia for the final when the local VAD hears the user stop.
+
+        Args:
+            frame: Frame to process.
+            direction: Direction of frame processing.
+        """
+        await super().process_frame(frame, direction)
+        if (
+            isinstance(frame, VADUserStoppedSpeakingFrame)
+            and self._enable_finalize
+            and not self.end_of_turn_enabled
+            and self._websocket
+            and self._websocket.state is State.OPEN
+        ):
+            # https://eu1.docs.gladia.io/live/finalize/
+            self.request_finalize()
+            await self._websocket.send(json.dumps({"type": "finalize"}))
+
+    async def _on_finalize(self, content: dict[str, Any]):
+        """Handle Gladia's answer to ``finalize``, sent after the final it produced."""
+        data = content.get("data") or {}
+        if not content.get("acknowledged"):
+            error = (content.get("error") or {}).get("message", "Unknown error")
+            logger.debug(f"{self} finalize not acknowledged: {error}")
+        elif not data.get("finalized"):
+            # Gladia's endpointing had already sent the final: report its latency
+            # now instead of waiting for the TTFB timeout.
+            await self.stop_ttfb_metrics()
+            await self._cancel_ttfb_timeout()
+
     async def _send_audio(self, audio: bytes):
         """Send audio chunk with proper message format."""
         if self._websocket and self._websocket.state is State.OPEN:
@@ -810,6 +850,8 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
                     transcript = utterance["text"]
                     is_final = content["data"]["is_final"]
                     if is_final:
+                        if content["data"].get("from_finalize"):
+                            self.confirm_finalize()
                         self._turn_finals.append(transcript)
                         self._turn_partial = ""
                         # Report usage before the transcription frame so
@@ -866,6 +908,8 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
                     await self._on_eager_end_of_turn(content.get("data") or {})
                 elif content["type"] == "turn_resumed":
                     await self._on_turn_resumed(content.get("data") or {})
+                elif content["type"] == "finalize":
+                    await self._on_finalize(content)
                 elif content["type"] == "hold":
                     await self._call_event_handler("on_hold", content.get("data") or {})
             except json.JSONDecodeError:
