@@ -16,6 +16,7 @@ import json
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import aiohttp
 import websockets
@@ -37,6 +38,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.services.gladia.config import (
+    DiarizationConfig,
     EndOfTurnConfig,
     GladiaInputParams,
     LanguageConfig,
@@ -53,6 +55,22 @@ from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
+
+# Fields of Gladia's cloud API that the Enterprise API refuses, failing the session.
+_CLOUD_ONLY_FIELDS = (
+    ("pre_processing", "audio_enhancer"),
+    ("realtime_processing", "words_accurate_timestamps"),
+)
+
+
+def _drop_cloud_only_fields(settings: dict[str, Any]) -> None:
+    """Leave out the cloud-only fields the Enterprise API would refuse."""
+    for section, name in _CLOUD_ONLY_FIELDS:
+        if name in settings.get(section, {}):
+            logger.warning(f"Gladia's Enterprise API has no {section}.{name}: it is left out")
+            del settings[section][name]
+            if not settings[section]:
+                del settings[section]
 
 
 def language_to_gladia_language(language: Language) -> str:
@@ -187,6 +205,16 @@ class GladiaSTTSettings(STTSettings):
         messages_config: WebSocket message filtering options.
         enable_vad: Enable VAD to trigger end of utterance detection.
         end_of_turn: End-of-turn detection (Gladia Enterprise API). None leaves it off.
+        diarization: Label each final with its speaker (Gladia Enterprise API): the
+            transcription frames' ``user_id`` is then ``"S0"``, ``"S1"``...
+        diarization_config: Diarization options. Needs ``diarization``.
+        numerals: Write spoken numbers, amounts and times with digits (Gladia Enterprise
+            API): True, or ``{"region": "FR"}`` for a country's phone numbers and dates.
+        emails: Write dictated e-mail addresses as addresses (Gladia Enterprise API).
+        addresses: Write dictated postal addresses in their standard form (Gladia
+            Enterprise API): True, or its options (``{"country": "FR"}``).
+        pii: Redact personal data in the finals (Gladia Enterprise API): True, or its
+            options (``{"entities": "pci", "mode": "mask"}``). No partials are sent then.
     """
 
     language_config: LanguageConfig | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
@@ -202,6 +230,14 @@ class GladiaSTTSettings(STTSettings):
     messages_config: MessagesConfig | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
     enable_vad: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
     end_of_turn: EndOfTurnConfig | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    diarization: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    diarization_config: DiarizationConfig | None | NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    numerals: bool | dict[str, Any] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    emails: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    addresses: bool | dict[str, Any] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    pii: bool | dict[str, Any] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
@@ -316,6 +352,12 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
             messages_config=None,
             enable_vad=False,
             end_of_turn=None,
+            diarization=None,
+            diarization_config=None,
+            numerals=None,
+            emails=None,
+            addresses=None,
+            pii=None,
         )
 
         # 2. Apply direct init arg overrides (deprecated)
@@ -453,6 +495,18 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
         """
         return language_to_gladia_language(language)
 
+    @property
+    def _is_enterprise_api(self) -> bool:
+        """Whether the session goes to the Enterprise API (eu1, us1) rather than the cloud."""
+        return urlparse(self._url).hostname != "api.gladia.io"
+
+    def _speaker_user_id(self, utterance: dict[str, Any]) -> str:
+        """The user ID of an utterance: its speaker, with diarization."""
+        speaker = utterance.get("speaker")
+        if self._settings.diarization and isinstance(speaker, int):
+            return f"S{speaker}"
+        return self._user_id
+
     def _prepare_settings(self) -> dict[str, Any]:
         s = self._settings
 
@@ -500,6 +554,17 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
         end_of_turn = assert_given(s.end_of_turn)
         if end_of_turn is not None:
             settings["end_of_turn"] = end_of_turn.model_dump(exclude_none=True)
+
+        for name in ("diarization", "numerals", "emails", "addresses", "pii"):
+            value = assert_given(getattr(s, name))
+            if value is not None and value is not False:
+                settings[name] = value
+        diarization_config = assert_given(s.diarization_config)
+        if diarization_config is not None and s.diarization:
+            settings["diarization_config"] = diarization_config.model_dump(exclude_none=True)
+
+        if self._is_enterprise_api:
+            _drop_cloud_only_fields(settings)
 
         # The eager end of turn carries no text: build it from the partials
         if self.eager_end_of_turn_enabled:
@@ -861,7 +926,7 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
                         await self.push_frame(
                             TranscriptionFrame(
                                 transcript,
-                                self._user_id,
+                                self._speaker_user_id(utterance),
                                 time_now_iso8601(),
                                 language,
                                 result=content,
@@ -877,7 +942,7 @@ class GladiaSTTService(EagerEndOfTurnSTTServiceMixin, WebsocketSTTService):
                         await self.push_frame(
                             InterimTranscriptionFrame(
                                 transcript,
-                                self._user_id,
+                                self._speaker_user_id(utterance),
                                 time_now_iso8601(),
                                 language,
                                 result=content,

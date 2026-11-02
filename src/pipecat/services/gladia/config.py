@@ -6,7 +6,7 @@
 
 """Configuration for the Gladia STT service."""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -29,12 +29,14 @@ class PreProcessingConfig(BaseModel):
     """Configuration for audio pre-processing options.
 
     Parameters:
-        audio_enhancer: Apply pre-processing to the audio stream to enhance quality
-        speech_threshold: Sensitivity for speech detection (0-1)
+        audio_enhancer: Apply pre-processing to the audio stream to enhance quality.
+            Not on the Enterprise API: it is left out there.
+        speech_threshold: Sensitivity for speech detection (0-1). ``"auto"`` (solaria-3
+            on the Enterprise API) adapts to the speaker.
     """
 
     audio_enhancer: bool | None = None
-    speech_threshold: float | None = None
+    speech_threshold: float | Literal["auto"] | None = None
 
 
 class CustomVocabularyItem(BaseModel):
@@ -123,6 +125,22 @@ class RealtimeProcessingConfig(BaseModel):
     sentiment_analysis: bool | None = None
 
 
+class SpeculationConfig(BaseModel):
+    """Options of the end-of-turn speculation (Gladia Enterprise API).
+
+    Parameters:
+        threshold: Similarity, above 0 and at most 1, from which the final recommends
+            keeping the reply started on the end of turn (default 0.85).
+        entities: Named entities new in the final that make it recommend ``discard``
+            whatever the similarity: True, False, a preset or type, a list, or
+            ``{"enable": [...], "disable": [...]}``. Needs ``named_entity_recognition``
+            or ``pii``.
+    """
+
+    threshold: float | None = None
+    entities: bool | str | list[str] | dict[str, list[str]] | None = None
+
+
 class EndOfTurnConfig(BaseModel):
     """Configuration for Gladia's end-of-turn detection.
 
@@ -140,8 +158,10 @@ class EndOfTurnConfig(BaseModel):
         window_s: Audio, in seconds, an evaluation reads.
         reeval_ms: Interval, in milliseconds, between two evaluations of the same pause.
         emit_scores: Also send an ``end_of_turn_score`` message for each evaluation.
+        vad_threshold: Speech probability, between 0 and 1, from which audio counts as
+            speech for the end-of-turn evaluation (default 0.5).
         speculation: Compare each final to the text of its end of turn and send a
-            ``speculation`` verdict.
+            ``speculation`` verdict: True, or a :class:`SpeculationConfig`.
     """
 
     eot_threshold: float | None = None
@@ -152,7 +172,20 @@ class EndOfTurnConfig(BaseModel):
     window_s: float | None = None
     reeval_ms: int | None = None
     emit_scores: bool | None = None
-    speculation: bool | None = None
+    vad_threshold: float | None = None
+    speculation: bool | SpeculationConfig | None = None
+
+
+class DiarizationConfig(BaseModel):
+    """Options of the speaker diarization (Gladia Enterprise API).
+
+    Parameters:
+        number_of_speakers: The number of speakers, when it is known.
+        max_speakers: The most speakers to tell apart.
+    """
+
+    number_of_speakers: int | None = None
+    max_speakers: int | None = None
 
 
 class MessagesConfig(BaseModel):

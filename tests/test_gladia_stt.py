@@ -22,7 +22,13 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.gladia.config import EndOfTurnConfig
+from pipecat.services.gladia.config import (
+    DiarizationConfig,
+    EndOfTurnConfig,
+    PreProcessingConfig,
+    RealtimeProcessingConfig,
+    SpeculationConfig,
+)
 from pipecat.services.gladia.stt import GladiaSTTService
 from pipecat.turns.user_turn_strategies import EagerUserTurnStrategies, ExternalUserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager
@@ -608,3 +614,78 @@ async def test_a_refused_finalize_waits_for_the_usual_final():
     await service._receive_messages()
 
     service.stop_ttfb_metrics.assert_not_awaited()
+
+
+def test_enterprise_options_are_sent_only_when_set():
+    default = GladiaSTTService(api_key="test-key")._prepare_settings()
+    for key in ("diarization", "diarization_config", "numerals", "emails", "addresses", "pii"):
+        assert key not in default
+
+    service = GladiaSTTService(
+        api_key="test-key",
+        url="https://eu1.api.gladia.io/v2/live",
+        settings=GladiaSTTService.Settings(
+            diarization=True,
+            diarization_config=DiarizationConfig(max_speakers=2),
+            numerals={"region": "CH"},
+            pii={"entities": "pci", "mode": "mask"},
+            pre_processing=PreProcessingConfig(speech_threshold="auto"),
+            end_of_turn=EndOfTurnConfig(
+                vad_threshold=0.6, speculation=SpeculationConfig(threshold=0.9, entities=True)
+            ),
+        ),
+    )
+    settings = service._prepare_settings()
+
+    assert settings["diarization"] is True
+    assert settings["diarization_config"] == {"max_speakers": 2}
+    assert settings["numerals"] == {"region": "CH"}
+    assert settings["pii"] == {"entities": "pci", "mode": "mask"}
+    assert settings["pre_processing"] == {"speech_threshold": "auto"}
+    assert settings["end_of_turn"] == {
+        "vad_threshold": 0.6,
+        "speculation": {"threshold": 0.9, "entities": True},
+    }
+
+
+def test_cloud_only_fields_are_left_out_on_the_enterprise_api():
+    pre_processing = PreProcessingConfig(audio_enhancer=True, speech_threshold=0.4)
+    realtime_processing = RealtimeProcessingConfig(words_accurate_timestamps=True)
+
+    def settings_for(url):
+        return GladiaSTTService(
+            api_key="test-key",
+            url=url,
+            settings=GladiaSTTService.Settings(
+                pre_processing=pre_processing, realtime_processing=realtime_processing
+            ),
+        )._prepare_settings()
+
+    enterprise = settings_for("https://eu1.staging.api.gladia.io/v2/live")
+    assert enterprise["pre_processing"] == {"speech_threshold": 0.4}
+    assert "realtime_processing" not in enterprise
+
+    cloud = settings_for("https://api.gladia.io/v2/live")
+    assert cloud["pre_processing"] == {"audio_enhancer": True, "speech_threshold": 0.4}
+    assert cloud["realtime_processing"] == {"words_accurate_timestamps": True}
+
+
+@pytest.mark.asyncio
+async def test_diarization_puts_the_speaker_in_the_user_id():
+    def spoken(text, is_final, speaker):
+        message = _transcript(text, is_final)
+        message["data"]["utterance"]["speaker"] = speaker
+        return message
+
+    incoming = [spoken("Bon", False, 1), spoken("Bonjour.", True, 1)]
+    service, _ = _connected_service(
+        incoming=incoming, settings=GladiaSTTService.Settings(diarization=True)
+    )
+    service.push_frame = AsyncMock()
+    await service._receive_messages()
+    assert [f.user_id for f in _pushed(service)] == ["S1", "S1"]
+
+    plain, _ = _connected_service(incoming=incoming)
+    plain.push_frame = AsyncMock()
+    await plain._receive_messages()
+    assert [f.user_id for f in _pushed(plain)] == [plain._user_id] * 2
